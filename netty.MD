@@ -55,7 +55,7 @@ I/O模型
 - 可靠性问题：由于I/O操作采用同步阻塞模式，当网络拥塞或者通信对端处理缓慢会导致I/O线程被挂住，阻塞时间无法预测；
 - 可维护性问题：I/O线程数无法有效控制、资源无法有效共享（多线程并发问题），系统可维护性差；
 
-*几种I/O模型的功能和特性对比：*
+*几种I/O模型的功能和特性对比 * ：
 ![](http://i.imgur.com/JYHI5mH.png)
 Netty的I/O模型基于非阻塞I/O实现，底层依赖的是JDK NIO框架的Selector。
 Selector提供选择已经就绪的任务的能力。简单来讲，**Selector会不断地轮询注册在其上的Channel，如果某个Channel上面有新的TCP连接接入、读和写事件，这个Channel就处于就绪状态，会被Selector轮询出来，然后通过SelectionKey可以获取就绪Channel的集合，进行后续的I/O操作。**
@@ -90,7 +90,7 @@ NIO 有一个主要的类Selector，这个类似一个观察者，只要我们�
 反应器模式与观察者模式在某些方面极为相似：**当一个主体发生改变时，所有依属体都得到通知。不过，观察者模式与单个事件源关联，而反应器模式则与多个事件源关联 。**
 ### 一般模型###
 	我们想象以下情形：长途客车在路途上，有人上车有人下车，但是乘客总是希望能够在客车上得到休息。
-	
+
 **传统的做法是**：每隔一段时间（或每一个站），司机或售票员对每一个乘客询问是否下车。
 **反应器模式做法是**：汽车是乘客访问的主体（Reactor），乘客上车后，到售票员（acceptor）处登记，之后乘客便可以休息睡觉去了，当到达乘客所要到达的目的地后，售票员将其唤醒即可。
 
@@ -154,23 +154,122 @@ Netty提供的心跳检测机制分为三种：
 
 心跳检测机制分为三个层面：
 
-- TCP层面的心跳检测，即TCP的Keep-Alive机制，它的作用域是整个TCP协议栈；
+- TCP层面的心跳检测，即TCP的Keep-Alive机制，它的作用域是**整个TCP协议栈**；
 - 协议层的心跳检测，主要存在于长连接协议中。例如SMPP协议；
 - 应用层的心跳检测，它主要由各业务产品通过约定方式定时给对方发送心跳消息实现。
+
+> Keep-Alive仅仅是TCP协议层会发送连通性检测包，但并不代表设置了Keep-Alive就是长连接了。
+
 
 心跳检测的目的就是确认当前链路可用，对方活着并且能够正常接收和发送消息。做为高可靠的NIO框架，Netty也提供了基于链路空闲的心跳检测机制：
 - 读空闲，链路持续时间t没有读取到任何消息；
 - 写空闲，链路持续时间t没有发送任何消息；
 - 读写空闲，链路持续时间t没有接收或者发送任何消息。
+	> netty自带心跳处理Handler
+	IdleStateHandler
 
+代码片段:
+```
+ 	//心跳
+    ch.pipeline().addLast("idle",new IdleStateHandler(0, 0, 55));
+    ch.pipeline().addLast("heartBeat",new HeartBeatHandler());
+
+    public class HeartBeatHandler extends ChannelDuplexHandler {
+
+	@Override
+	public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+		if (evt instanceof IdleStateEvent) {
+            IdleStateEvent e = (IdleStateEvent) evt;
+            if (e.state() == IdleState.ALL_IDLE) {
+            	CMPPActive active = new CMPPActive();
+            	ctx.writeAndFlush(active);
+            }
+        }
+
+	}
+}
+```
 补充：
-### TCP/IP半关闭 ###
-
 ### 客户端和服务端之间连接断开机制 ###
-#### 四次离手 ####
+TCP连接的建立需要三个分节(三次握手)，终止则需要四个分节。
+1. 某个应用进程首先调用close，称该端执行*主动关闭(active close)*。该端的TCP于是发送一个FIN分节，表示**数据发送完毕**。
+2. 接收到这个FIN分节的对端执行*被动关闭(passive close)* 。这个FIN由TCP确认。他的接收也作为**一个文件结束符传递给接收端应用程序**，因为FIN的接收意味着接收端应用程序在相应连接上再无额外数据可以收取;
+3. 一段时间后，接收到这个文件结束符的**应用程序**调用close管理他的套接字。这导致他的TCP也发送一个FIN。
+4. 接收这个最终FIN的原发送端TCP(执行主动关闭的那一端)确认这个FIN。
+
+既然每个方向都需要一个FIN和一个ACK，因此通常需要4个分节。但是某些情况下步骤1的FIN随数据一起发送；另外，步骤2和步骤3发送的分节都处在执行被动关闭的那一端，有可能合并成一个分节发送。
+![](http://i.imgur.com/hxUN15V.png)
+TCP关闭连接时对应的状态图如下:
+![](http://i.imgur.com/YEIdmdI.jpg)
+>对于大量短连接的情况下，经常出现卡在FIN_WAIT2和TIMEWAIT状态的连接，等待系统回收，但是操作系统底层回收的时间频率很长，导致SOCKET被耗尽。解决方案如下:
+
+**Linux平台:**
+```
+	#!/bin/sh
+
+	echo "Now,config system parameters..."
+
+	echo "#config for MWGATE" >> /etc/sysctl.conf
+	#当出现SYN等待队列溢出时，启用cookies来处理，可防范少量SYN攻击
+	echo 'net.ipv4.tcp_syncookies = 1' >> /etc/sysctl.conf
+	#允许将TIME-WAIT sockets重新用于新的TCP连接，默认为0，表示关闭；
+	echo 'net.ipv4.tcp_tw_reuse = 1' >> /etc/sysctl.conf
+	#TIM_WAIT_2也就是FIN_SYN_2的等待时间
+	echo 'net.ipv4.tcp_fin_timeout = 30' >> /etc/sysctl.conf
+	#表示开启TCP连接中TIME-WAIT sockets的快速回收，默认为0，表示关闭。
+	echo 'net.ipv4.tcp_tw_recycle = 1' >>/etc/sysctl.conf
+	FILEMAX=$(cat /proc/sys/fs/file-max)
+	PORTRANGE="net.ipv4.ip_local_port_range = 1024 $FILEMAX"
+	echo $PORTRANGE >> /etc/sysctl.conf
+	echo "#end config for MWGATE" >> /etc/sysctl.conf
+
+	echo '#config for MWGATE' >> /etc/security/limits.conf
+	SOFTLIMIT="* soft nofile $FILEMAX"
+	HARDLIMIT="* hard nofile $FILEMAX"
+	echo "$SOFTLIMIT" >> /etc/security/limits.conf
+	echo "$HARDLIMIT" >> /etc/security/limits.conf
+	echo '#end config for MWGATE' >> /etc/security/limits.conf
+
+	echo "#config for MWGATE" >> /etc/pam.d/login
+	echo 'session required /lib/security/pam_limits.so' >> /etc/pam.d/login
+	echo "#end config for MWGATE" >> /etc/pam.d/login
+
+	sysctl -p
+
+	echo "#config for MWGATE" >> /etc/profile
+	echo 'ulimit -S -c unlimited > /dev/null 2>&1' >> /etc/profile
+	echo "#end config for MWGATE" >> /etc/profile
+
+	echo 'core-%p-%t' >> /proc/sys/kernel/core_pattern
+
+	source /etc/profile
+
+	echo "Config is OK..."
+```
+**Windows平台:**
+```
+	Windows Registry Editor Version 5.00
+	[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters]
+	"MaxUserPort"=dword:0000fffe
+	"TCPTimedWaitDelay"=dword:00000005
+```
+
+#### TCP状态图 ####
+![TCP状态转化图](http://i.imgur.com/2AbvNs6.png)
+### TCP/IP半关闭 ###
+从上述讲的TCP关闭的四个分节可以看出，被动关闭执行方，发送FIN分节的前提是TCP套接字对应应用程序调用close产生的。如果服务端有数据发送给客户端那么可能存在服务端在接受到FIN之后，需要将数据发送到客户端才能发送FIN字节。这种处于业务考虑的情形通常称为半关闭。
+>半关闭可能导致大量socket处于CLOSE_WAIT状态
+
 
 #### 谁负责关闭连接合理 ####
+连接关闭触发的条件通常分为如下几种:
+1. 数据发送完成(发送到对端并且收到响应)，关闭连接；
+2. 通信过程中产生异常；
+3. 特殊指令强制要求关闭连接；
 
+对于第一种，通常关闭时机是，数据发送完成方发起(客户端触发居多)；
+对于第二种，异常产生方触发(例如残包、错误数据等)发起。但是此种情况可能也导致压根无法发送FIN。
+对于第三种，通常是用于运维等。由命令发起方产生。
 
 
 流量整形
@@ -199,11 +298,11 @@ Netty的优雅停机三部曲：
 
 ![](http://i.imgur.com/SleE1N1.png)
 
-Java的优雅停机通常通过注册JDK的ShutdownHook来实现，当系统接收到退出指令后，首先标记系统处于退出状态，不再接收新的消息，然后将积压的消息处理完，最后调用资源回收接口将资源销毁，最后各线程退出执行。 
+Java的优雅停机通常通过注册JDK的ShutdownHook来实现，当系统接收到退出指令后，首先标记系统处于退出状态，不再接收新的消息，然后将积压的消息处理完，最后调用资源回收接口将资源销毁，最后各线程退出执行。
 
 通常优雅退出需要有超时控制机制，例如30S，如果到达超时时间仍然没有完成退出前的资源回收等操作，则由停机脚本直接调用kill -9 pid，强制退出。
 
-在实际项目中，Netty作为高性能的异步NIO通信框架，往往用作基础通信框架负责各种协议的接入、解析和调度等，例如在RPC和分布式服务框架中，往往会使用Netty作为内部私有协议的基础通信框架。 
+在实际项目中，Netty作为高性能的异步NIO通信框架，往往用作基础通信框架负责各种协议的接入、解析和调度等，例如在RPC和分布式服务框架中，往往会使用Netty作为内部私有协议的基础通信框架。
 当应用进程优雅退出时，作为通信框架的Netty也需要优雅退出，主要原因如下：
 - 尽快的释放NIO线程、句柄等资源；
 - 如果使用flush做批量消息发送，需要将积攒在发送队列中的待发送消息发送完成；
@@ -264,8 +363,8 @@ Netty的架构可扩展性设计理念如下：
 - 判断扩展点，事先预留相关扩展接口，给用户二次定制和扩展使用；
 - 主要功能点都基于接口编程，方便用户定制和扩展。
 
-精彩问答
-----
+精彩问答(摘抄自 [一篇文章，读懂Netty的高性能架构之道](http://mp.weixin.qq.com/s?__biz=MzA5Nzc4OTA1Mw==&mid=2659597788&idx=1&sn=8b226411fdf8d3f803d08d0c067e4ac2&scene=25&srcid=07266rCehjPwWwVM94nGeUqn#wechat_redirect) )
+---------
 **
 问：据我之前了解到，Java的NIO selector底层在Windows下的实现是起两个随机端口互联来监测连接或读写事件，在Linux上是利用管道实现的；我有遇到过这样的需求，需要占用很多个固定端口做服务端，如果在Windows下，利用NIO框架（Mina或Netty）就有可能会造成端口冲突，这种情况有什么好的解决方案吗？**
 >Linux使用Pipe实现网络监听，Windows要启动端口。目前没有更好的办法，建议的方式是作为服务端的端口可以规划一个范围，然后根据节点和进程信息动态生成，如果发现端口冲突，可以在规划范围内基于算法重新生成一个新的端口。
