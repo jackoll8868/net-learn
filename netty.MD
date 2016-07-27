@@ -10,8 +10,8 @@ Netty笔记整理
 - [x] 序列化
 - [x] 资源回收
 - [x] 粘连包解决方法
-- [ ] 断线重连解决方法
-- [ ] Future-Listener机制
+- [x] 断线重连解决方法
+- [x] Future-Listener机制
 - [ ] 责任链机制
 
 
@@ -391,6 +391,133 @@ Netty自带的几种粘连包解决方案:
 	2. FixedLengthFrameDecoder
 	3. LengthFieldBasedFrameDecoder
 
+
+Netty Client断网重连机制
+------------------
+对于长连接的程序断网重连几乎是程序的标配。断网重连具体可以分为两类:
+1. CONNECT失败，需要重连；
+2. 程序运行过程中断网、远程强制关闭连接、收到错误包必须重连；
+
+对于第一种解决方案是:
+
+	实现ChannelFutureListener 用来启动时监测是否连接成功，不成功的话重试
+```
+	private void doConnect() {
+    Bootstrap b = ...;
+    b.connect().addListener((ChannelFuture f) -> {
+        if (!f.isSuccess()) {
+            long nextRetryDelay = nextRetryDelay(...);
+            f.channel().eventLoop().schedule(nextRetryDelay, ..., () -> {
+                doConnect();
+            }); // or you can give up at some point by just doing nothing.
+        }
+    });
+}
+```
+或者
+```
+public class ConnectionListener implements ChannelFutureListener {  
+  private Client client;  
+  public ConnectionListener(Client client) {  
+    this.client = client;  
+  }  
+  @Override  
+  public void operationComplete(ChannelFuture channelFuture) throws Exception {  
+    if (!channelFuture.isSuccess()) {  
+      System.out.println("Reconnect");  
+      //因为是建立网络连接所以可以共用EventLoop
+      final EventLoop loop = channelFuture.channel().eventLoop();  
+      loop.schedule(new Runnable() {  
+        @Override  
+        public void run() {  
+          client.createBootstrap(new Bootstrap(), loop);  
+        }  
+      }, 1L, TimeUnit.SECONDS);  
+    }  
+  }  
+}
+```
+
+对于第二种:
+```
+public Bootstrap createBootstrap(Bootstrap bootstrap, EventLoopGroup eventLoop) {  
+     if (bootstrap != null) {  
+       final MyInboundHandler handler = new MyInboundHandler(this);  
+       bootstrap.group(eventLoop);  
+       bootstrap.channel(NioSocketChannel.class);  
+       bootstrap.option(ChannelOption.SO_KEEPALIVE, true);  
+       bootstrap.handler(new ChannelInitializer<SocketChannel>() {  
+         @Override  
+         protected void initChannel(SocketChannel socketChannel) throws Exception {  
+           socketChannel.pipeline().addLast(handler);  
+         }  
+       });  
+       bootstrap.remoteAddress("localhost", 8888);
+       bootstrap.connect().addListener(new ConnectionListener(this)); 
+     }  
+     return bootstrap;  
+   }  
+   
+public class MyInboundHandler extends SimpleChannelInboundHandler {  
+   private Client client;  
+   public MyInboundHandler(Client client) {  
+     this.client = client;  
+   }  
+   @Override  
+   public void channelInactive(ChannelHandlerContext ctx) throws Exception {  
+     final EventLoop eventLoop = ctx.channel().eventLoop();  
+     eventLoop.schedule(new Runnable() {  
+       @Override  
+       public void run() {  
+         client.createBootstrap(new Bootstrap(), eventLoop);  
+       }  
+     }, 1L, TimeUnit.SECONDS);  
+     super.channelInactive(ctx);  
+   }  
+ }
+```
+Future-Listener机制
+-----------------
+Future在netty中位于io.netty.concurrent包中，其依赖关系如下:
+![](http://i.imgur.com/COTiO1G.png)
+
+  在并发编程中，我们通常会用到一组非阻塞的模型:Promise,Future,Callback。其中的Future表示**一个可能还没有实际完成的异步任务的结果**,针对这个结果添加Callback以便在执行任务**成功或者失败**后做出响应的操作。
+  而经由Promise交给执行者，任务执行者通过Promise可以标记任务完成或者失败。以上这套模型是很多异步非阻塞框架的基础。
+  具体的理解可参见JDK的FutureTask和Callable。JDK的实现版本，在获取最终结果的时候，不得不做一些阻塞的方法等待最终结果的到来。
+  Netty的Future机制是JDK机制的一个子版本，它支持给Future添加Listener，以方便EventLoop在任务调度完成之后调用。
+ 
+这里借用[Scala中Future机制](https://code.csdn.net/DOC_Scala/chinese_scala_offical_document/file/Futures-and-Promises-cn.md)来讲解一下Future、Callback、Promise具体是什么.
+### 简介 ###
+Future提供了一套高效便捷的非阻塞并行操作管理方案。其基本思想很简单，所谓Future，指的是一类占位符对象，用于指代某些尚未完成的计算的结果。一般来说，由Future指代的计算都是并行执行的，计算完毕后可另行获取相关计算结果。以这种方式组织并行任务，便可以写出高效、异步、非阻塞的并行代码。
+
+默认情况下，future和promise并不采用一般的阻塞操作，而是依赖回调进行非阻塞操作。为了在语法和概念层面更加简明扼要地使用这些回调。当然，future仍然支持阻塞操作——必要时，可以阻塞(sync、await、awaitUninterruptibly)等待future（不过并不鼓励这样做）。
+### Future ###
+所谓Future，是一种用于指代某个尚未就绪的值的对象。而这个值，往往是某个计算过程的结果：
+- 若该计算过程尚未完成，我们就说该Future未就位；
+- 若该计算过程正常结束，或中途抛出异常，我们就说该Future已就位。
+
+Future的就位分为两种情况：
+- 当Future带着某个值就位时，我们就说该Future携带计算结果成功就位。
+- 当Future因对应计算过程抛出异常而就绪，我们就说这个Future因该异常而失败。
+
+Future的一个重要属性在于**它只能被赋值一次**。一旦给定了某个值或某个异常，future对象就变成了不可变对象——无法再被改写。
+
+### Callbacks(回调函数) ###
+Callback用于对计算的最终结果Future做一些后续的处理，以便我们能够用它来做一些有用的事。我们经常对计算结果感兴趣而不仅仅是它的副作用。
+
+### Promises ###
+如果说futures是为了一个还没有存在的结果，而当成一种只读占位符的对象类型去创建，那么Promise就被认为是一个可写的，可以实现一个Future的单一赋值容器。这就是说，promise通过这种success方法可以成功去实现一个带有值的future。相反的，因为一个失败的promise通过failure方法就会实现一个带有异常的future。
+### Future和Promise的区别 ###
+Promise与Future的区别在于，Future是Promise的一个只读的视图，也就是说Future没有设置任务结果的方法，只能获取任务执行结果或者为Future添加回调函数。
+参考文档:
+[WiKi](https://en.wikipedia.org/wiki/Futures_and_promises)
+[Scala](http://docs.scala-lang.org/overviews/core/futures.html)
+
+
+责任链机制
+-----
+
+----------
 
 精彩问答(摘抄自 [一篇文章，读懂Netty的高性能架构之道](http://mp.weixin.qq.com/s?__biz=MzA5Nzc4OTA1Mw==&mid=2659597788&idx=1&sn=8b226411fdf8d3f803d08d0c067e4ac2&scene=25&srcid=07266rCehjPwWwVM94nGeUqn#wechat_redirect) )
 ---------
