@@ -13,6 +13,9 @@ Netty笔记整理
 - [x] 断线重连解决方法
 - [x] Future-Listener机制
 - [ ] 责任链机制
+- [x] ByteBuf And Reference-Count
+- [x] Netty解包组包
+- [ ] 滑动窗口协议
 
 
 
@@ -416,64 +419,64 @@ Netty Client断网重连机制
 ```
 或者
 ```
-public class ConnectionListener implements ChannelFutureListener {  
-  private Client client;  
-  public ConnectionListener(Client client) {  
-    this.client = client;  
-  }  
-  @Override  
-  public void operationComplete(ChannelFuture channelFuture) throws Exception {  
-    if (!channelFuture.isSuccess()) {  
-      System.out.println("Reconnect");  
+public class ConnectionListener implements ChannelFutureListener {
+  private Client client;
+  public ConnectionListener(Client client) {
+    this.client = client;
+  }
+  @Override
+  public void operationComplete(ChannelFuture channelFuture) throws Exception {
+    if (!channelFuture.isSuccess()) {
+      System.out.println("Reconnect");
       //因为是建立网络连接所以可以共用EventLoop
-      final EventLoop loop = channelFuture.channel().eventLoop();  
-      loop.schedule(new Runnable() {  
-        @Override  
-        public void run() {  
-          client.createBootstrap(new Bootstrap(), loop);  
-        }  
-      }, 1L, TimeUnit.SECONDS);  
-    }  
-  }  
+      final EventLoop loop = channelFuture.channel().eventLoop();
+      loop.schedule(new Runnable() {
+        @Override
+        public void run() {
+          client.createBootstrap(new Bootstrap(), loop);
+        }
+      }, 1L, TimeUnit.SECONDS);
+    }
+  }
 }
 ```
 
 对于第二种:
 ```
-public Bootstrap createBootstrap(Bootstrap bootstrap, EventLoopGroup eventLoop) {  
-     if (bootstrap != null) {  
-       final MyInboundHandler handler = new MyInboundHandler(this);  
-       bootstrap.group(eventLoop);  
-       bootstrap.channel(NioSocketChannel.class);  
-       bootstrap.option(ChannelOption.SO_KEEPALIVE, true);  
-       bootstrap.handler(new ChannelInitializer<SocketChannel>() {  
-         @Override  
-         protected void initChannel(SocketChannel socketChannel) throws Exception {  
-           socketChannel.pipeline().addLast(handler);  
-         }  
-       });  
+public Bootstrap createBootstrap(Bootstrap bootstrap, EventLoopGroup eventLoop) {
+     if (bootstrap != null) {
+       final MyInboundHandler handler = new MyInboundHandler(this);
+       bootstrap.group(eventLoop);
+       bootstrap.channel(NioSocketChannel.class);
+       bootstrap.option(ChannelOption.SO_KEEPALIVE, true);
+       bootstrap.handler(new ChannelInitializer<SocketChannel>() {
+         @Override
+         protected void initChannel(SocketChannel socketChannel) throws Exception {
+           socketChannel.pipeline().addLast(handler);
+         }
+       });
        bootstrap.remoteAddress("localhost", 8888);
-       bootstrap.connect().addListener(new ConnectionListener(this)); 
-     }  
-     return bootstrap;  
-   }  
-   
-public class MyInboundHandler extends SimpleChannelInboundHandler {  
-   private Client client;  
-   public MyInboundHandler(Client client) {  
-     this.client = client;  
-   }  
-   @Override  
-   public void channelInactive(ChannelHandlerContext ctx) throws Exception {  
-     final EventLoop eventLoop = ctx.channel().eventLoop();  
-     eventLoop.schedule(new Runnable() {  
-       @Override  
-       public void run() {  
-         client.createBootstrap(new Bootstrap(), eventLoop);  
-       }  
-     }, 1L, TimeUnit.SECONDS);  
-     super.channelInactive(ctx);  
-   }  
+       bootstrap.connect().addListener(new ConnectionListener(this));
+     }
+     return bootstrap;
+   }
+
+public class MyInboundHandler extends SimpleChannelInboundHandler {
+   private Client client;
+   public MyInboundHandler(Client client) {
+     this.client = client;
+   }
+   @Override
+   public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+     final EventLoop eventLoop = ctx.channel().eventLoop();
+     eventLoop.schedule(new Runnable() {
+       @Override
+       public void run() {
+         client.createBootstrap(new Bootstrap(), eventLoop);
+       }
+     }, 1L, TimeUnit.SECONDS);
+     super.channelInactive(ctx);
+   }
  }
 ```
 Future-Listener机制
@@ -485,7 +488,7 @@ Future在netty中位于io.netty.concurrent包中，其依赖关系如下:
   而经由Promise交给执行者，任务执行者通过Promise可以标记任务完成或者失败。以上这套模型是很多异步非阻塞框架的基础。
   具体的理解可参见JDK的FutureTask和Callable。JDK的实现版本，在获取最终结果的时候，不得不做一些阻塞的方法等待最终结果的到来。
   Netty的Future机制是JDK机制的一个子版本，它支持给Future添加Listener，以方便EventLoop在任务调度完成之后调用。
- 
+
 这里借用[Scala中Future机制](https://code.csdn.net/DOC_Scala/chinese_scala_offical_document/file/Futures-and-Promises-cn.md)来讲解一下Future、Callback、Promise具体是什么.
 ### 简介 ###
 Future提供了一套高效便捷的非阻塞并行操作管理方案。其基本思想很简单，所谓Future，指的是一类占位符对象，用于指代某些尚未完成的计算的结果。一般来说，由Future指代的计算都是并行执行的，计算完毕后可另行获取相关计算结果。以这种方式组织并行任务，便可以写出高效、异步、非阻塞的并行代码。
@@ -516,8 +519,247 @@ Promise与Future的区别在于，Future是Promise的一个只读的视图，也
 
 责任链机制
 -----
+	TODO
+
+
+ByteBuf
+-------
+ByteBuf类似与JDK的ByteBuffer，但是在ByteBuffer的基础上做了优化，例如去除了讨厌的flip()；
+ByteBuf对应的继承关系如下:
+![](http://i.imgur.com/rWTdrha.png)
+
+### ReferenceCount ###
+ByteBuf可以使用池化的ByteBuf(PooledHeapByteBuf)。详情参见官方文档[Reference counted objects](https://github.com/netty/netty/wiki/Reference-counted-objects)。
+
+#### Basics of reference counting ####
+初始状态下ByteBuf的reference count值是1；
+```
+	ByteBuf buf = ctx().alloc().buf();
+	assert buf.refCnt() == 1
+```
+当Realease ByteBuf的时候他的reference coutn值会减一。
+```
+	//调用release()方法返回为True的唯一条件是引用计数变为0
+	boolean released = buf.release();
+	assert released;
+	assert buf.refCnt() == 0
+```
+#### Dangling reference(指针悬挂) ####
+
+对一个应用技术的对象进行访问会抛出IllegalReferenceCountException异常。
+```
+	assert buf.refCnt() == 0;
+	try {
+	  buf.writeLong(0xdeadbeef);
+	  throw new Error("should not reach here");
+	} catch (IllegalReferenceCountExeception e) {
+	  // Expected
+	}
+```
+#### 增加应用计数 ####
+对于一个还未被销毁的对象可以使用retain()增加起引用计数值。
+```
+	ByteBuf buf = ctx.alloc().directBuffer();
+	assert buf.refCnt() == 1;
+
+	buf.retain();
+	assert buf.refCnt() == 2;
+
+	boolean destroyed = buf.release();
+	assert !destroyed;
+	assert buf.refCnt() == 1;
+```
+#### 谁来销毁它 ####
+通常来说最后一个调用这个对象的人负责销毁这个对象。但也有很多特殊情况:
+- 如果一个发送模块将数据传递给一个接收模块，那么发送模块不需要回收，而是将回收权利交给接收模块。
+- 如果一个模块消费了引用计数对象，并且明确知道该对象不会被传递到别的模块，那么该模块必须销毁此引用计数对象。
+
+下边是一个简单的例子:
+```
+	/**传递input到别的地方*/
+	public ByteBuf a(ByteBuf input) {
+	    input.writeByte(42);
+	    return input;
+	}
+	/**消费了Input并做了新的封装*/
+	public ByteBuf b(ByteBuf input) {
+	    try {
+	        output = input.alloc().directBuffer(input.readableBytes() + 1);
+	        output.writeBytes(input);
+	        output.writeByte(42);
+	        return output;
+	    } finally {
+	        input.release();
+	    }
+	}
+	/**单纯消费并且无需传递*/
+	public void c(ByteBuf input) {
+	    System.out.println(input);
+	    input.release();
+	}
+
+	public void main() {
+	    ...
+	    ByteBuf buf = ...;
+	    // This will print buf to System.out and destroy it.
+	    c(b(a(buf)));
+	    assert buf.refCnt() == 0;
+	}
+
+```
+
+| Action                         | Who should release?  | Who released?     |
+|--------------------------------|----------------------|-------------------|
+| 1. main() creates buf          | buf→main()           | x                 |
+| 2. main() calls a() with buf   | buf→a()              | x                 |
+| 3. a() returns buf merely.     | buf→main()           | x                 |
+| 4. main() calls b() with buf   | buf→b()              | x                 |
+| 5. b() returns the copy of buf | buf→b(), copy→main() | b() releases buf  |
+| 6. main() calls c() with copy  | copy→c()             | x                 |
+| 7. c() swallows copy           | copy→c()             | c() releases copy |
+
+#### Reference-counting in ChannelHandler ####
+
+#### Inbound messages ####
+当EventLoop读取到ByteBuf并且触发channelRead()事件，此时应该是跟pipeline相关的ChannelHandler销毁ByteBuf，因为，Handler消费了ByteBuf所以应该*channelReadl()*方法调用release()。
+```
+	public void channelRead(ChannelHandlerContext ctx, Object msg) {
+	    ByteBuf buf = (ByteBuf) msg;
+	    try {
+	        ...
+	    } finally {
+	        buf.release();
+	    }
+	}
+```
+但是如果你将这个ByteBuf或者其他的任何引用计数的对象传递给下一个Handler，那么该handler不用销毁。
+```
+	public void channelRead(ChannelHandlerContext ctx, Object msg) {
+	    ByteBuf buf = (ByteBuf) msg;
+	    ...
+	    ctx.fireChannelRead(buf);
+	}
+```
+*需要主意的是:*在Netty中ByteBuf不是唯一一个引用计数类型。如果你在使用由**Decoders**生成的消息的时候，那么极有可能该对象也是引用计数的。
+```
+// Assuming your handler is placed next to `HttpRequestDecoder`
+ public void channelRead(ChannelHandlerContext ctx, Object msg) {
+    if (msg instanceof HttpRequest) {
+        HttpRequest req = (HttpRequest) msg;
+        ...
+    }
+    if (msg instanceof HttpContent) {
+        HttpContent content = (HttpContent) msg;
+        try {
+            ...
+        } finally {
+            content.release();
+        }
+    }
+ }
+```
+如果你对到底该不该release()感到疑惑那么可以使用ReferenceCountUtil.release():
+```
+	public void channelRead(ChannelHandlerContext ctx, Object msg) {
+	    try {
+	        ...
+	    } finally {
+	        ReferenceCountUtil.release(msg);
+	    }
+	}
+```
+**另外，可以考虑继承SimpleChannelHanlder，它对你收到的所有消息调用ReferenceCountUtil.release()**
+
+#### Outbound messages ####
+不同于Inbound Messages，Outbound Message是由引用程序创建的。理论上应该由netty在他们将数据写入到链路层。当时的调用write()方法的Handler也应该release()任何可能的引用计数对象。
+```
+	// Simple-pass through
+	public void write(ChannelHandlerContext ctx, Object message, ChannelPromise promise) {
+	    System.err.println("Writing: " + message);
+	    ctx.write(message, promise);
+	}
+
+	// Transformation
+	public void write(ChannelHandlerContext ctx, Object message, ChannelPromise promise) {
+	    if (message instanceof HttpContent) {
+	        // Transform HttpContent to ByteBuf.
+	        HttpContent content = (HttpContent) message;
+	        try {
+	            ByteBuf transformed = ctx.alloc().buffer();
+	            ....
+	            ctx.write(transformed, promise);
+	        } finally {
+	            content.release();
+	        }
+	    } else {
+	        // Pass non-HttpContent through.
+	        ctx.write(message, promise);
+	    }
+	}
+```
+
+Netty解包组包
+---------
+对于TCP编程最常遇到的就是根据具体的协议进行组包或者解包。根据协议的不同大致可以分为如下几种类型:
+1. JAVA平台之间通过JAVA序列化进行解包组包(object->byte->object)；
+2. 固定长度的包结构(定长每个包都是M个字节的长度)；
+3. 带有明确分隔符协议的解包组包(例如HTTP协议\r\n\r\n)；
+4. 可动态扩展的协议，此种协议通常遵循消息头+消息体的机制，其中消息头的长度是固定的，消息体的长度根据具体业务的不同长度可能不同。例如(SMPP协议、CMPP协议);
+
+#### 序列化协议组包解包 ####
+可以使用的有:
+[MessagePack](http://msgpack.org/)
+[Google Protobuf](https://github.com/google/protobuf) 跨语言
+[JBOSS Marshalling](http://jbossmarshalling.jboss.org/)
+[Kryo](https://github.com/EsotericSoftware/kryo) 短小精悍
+[Hessian2](http://hessian.caucho.com/) 跨语言
+
+### 固定长度解包组包 ###
+ 参见Netty ：
+ [FixedLengthFrameDecoder ](http://netty.io/4.1/api/index.html) 解包
+[ MessageToByteEncoder](http://netty.io/4.1/api/index.html) 组包
+
+### 带有分隔符协议的解包组包 ###
+参见Netty:
+[DelimiterBasedFrameDecoder](http://netty.io/4.1/api/index.html) 解包
+[MessageToByteEncoder](http://netty.io/4.1/api/index.html) 组包
+
+### HTTP ###
+参见Netty:
+io.netty.codec.http
+### 消息头固定长度，消息体不固定长度协议解包组包 ###
+参见Netty:
+[LengthFieldBasedFrameDecoder](http://netty.io/4.1/api/index.html)
+
+*需要注意的是*：
+
+	对于解码的Handler必须做到在将ByteBuf解析成Object之后，需要将ByteBuf release()。
+
+数据安全性之滑动窗口协议
+------------
+我们假设一个场景，客户端每次请求服务端必须得到服务端的一个响应，由于TCP的数据发送和数据接收是异步的，就存在必须存在一个等待响应的过程。该过程根据实现方式不同可以分为一下几类(部分是错误案例):
+- 每次发送一个数据包，然后进入休眠(sleep)或者阻塞(await)状态，直到响应回来或者超时，整个调用链结束。此场景是典型的一问一答的场景，效率极其低下；
+- 读写分离，写模块只负责写，读模块则负责接收响应，然后做后续的处理。此种场景能尽可能的利用带宽进行读写。但是此场景不坐控速操作可能导致大量报文丢失或者重复发送。
+- 实现类似于Windowed Protocol。此窗口是以上两种方案的折中版，即允许一定数量的批量发送，又能保证数据的完整性。
+
+以下引用一段对滑动窗口协议作解释(PS.英文版，不想翻译了):
+参见Twitter的*com.cloudhopper.commons.util.window*包。
+A utility class to support "windowed" protocols that permit requests to be sent asynchronously and the responses to be processed at a later time. Responses may be returned in a different order than requests were sent.
+
+Windowed protocols generally provide high throughput over high latency links such as TCP/IP connections since they allow requests one after the other without waiting for a response before sending the next request. This allows the underlying TCP/IP socket to potentially buffer multiple requests in one packet.
+
+The "window" is the amount of unacknowledged requests that are permitted to be outstanding/unacknowledged at any given time. This implementation allows a max window size to be defined during construction. This represents the number of open "slots". When a response is received, it's up to the user of this class to make sure that response is added so that any threads waiting for a response are properly signaled.
+
+The life cycle of a request in a Window has 3 steps:
+1. Request offered
+	1. If free slot exists then goto 2
+	2. If no free slot exists, offer now "pending" and block for specified time.  May either timeout or if free slot opens, then goto 2
+2. Request accepted (caller may optionally await() on returned future till completion)
+3. Request completed/done (either success, failure, or cancelled)
 
 ----------
+
+
 
 精彩问答(摘抄自 [一篇文章，读懂Netty的高性能架构之道](http://mp.weixin.qq.com/s?__biz=MzA5Nzc4OTA1Mw==&mid=2659597788&idx=1&sn=8b226411fdf8d3f803d08d0c067e4ac2&scene=25&srcid=07266rCehjPwWwVM94nGeUqn#wechat_redirect) )
 ---------
